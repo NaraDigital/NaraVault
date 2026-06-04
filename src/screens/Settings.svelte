@@ -5,7 +5,6 @@
   import { parseBitwardenExport } from "../lib/import-bitwarden";
   import { vault } from "../lib/vault.svelte";
   import { toasts } from "../lib/toast.svelte";
-  import { confirm } from "../lib/confirm.svelte";
   import { api, type S3Config } from "../lib/api";
 
   interface Props {
@@ -15,6 +14,17 @@
     onchangeMaster: () => void;
   }
   let { count, onlock, onreset, onchangeMaster }: Props = $props();
+
+  // Idle auto-lock choices. `value` is a string for the <select>; "never" maps to
+  // null (no auto-lock), everything else is a millisecond delay.
+  const AUTO_LOCK_OPTIONS: { value: string; label: string }[] = [
+    { value: String(5 * 60 * 1000), label: "5 minutes" },
+    { value: String(10 * 60 * 1000), label: "10 minutes" },
+    { value: String(20 * 60 * 1000), label: "20 minutes" },
+    { value: String(30 * 60 * 1000), label: "30 minutes" },
+    { value: String(60 * 60 * 1000), label: "1 hour" },
+    { value: "never", label: "Never" },
+  ];
 
   let busy = $state<"" | "lock" | "reset" | "import" | "s3-save" | "s3-test" | "s3-export" | "s3-import">("");
 
@@ -441,6 +451,25 @@
     <span class="set-group-label mono">SECURITY</span>
     <div class="set-row">
       <div>
+        <strong>Auto-lock</strong><span class="set-desc"
+          >Lock the vault after inactivity. Choose <em>Never</em> to keep it open until you lock or quit.</span
+        >
+      </div>
+      <select
+        class="set-select"
+        value={tweaks.t.autoLockMs === null ? "never" : String(tweaks.t.autoLockMs)}
+        onchange={(e) => {
+          const v = (e.currentTarget as HTMLSelectElement).value;
+          tweaks.set("autoLockMs", v === "never" ? null : Number(v));
+        }}
+      >
+        {#each AUTO_LOCK_OPTIONS as opt}
+          <option value={opt.value}>{opt.label}</option>
+        {/each}
+      </select>
+    </div>
+    <div class="set-row">
+      <div>
         <strong>Lock vault</strong><span class="set-desc">Require master password to reopen.</span>
       </div>
       <Button
@@ -624,6 +653,20 @@
     cursor: pointer;
   }
   .s3-select:focus {
+    border-color: var(--accent);
+  }
+  .set-select {
+    padding: 8px 10px;
+    font-size: 13px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    outline: none;
+    cursor: pointer;
+    min-width: 130px;
+  }
+  .set-select:focus {
     border-color: var(--accent);
   }
   .s3-pw-btns {

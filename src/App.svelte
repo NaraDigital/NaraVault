@@ -69,14 +69,17 @@
   });
 
   // Auto-lock: wipe the in-memory DEK after a period of inactivity, so an
-  // unattended unlocked vault doesn't stay decrypted indefinitely.
-  const IDLE_LOCK_MS = 5 * 60 * 1000;
+  // unattended unlocked vault doesn't stay decrypted indefinitely. The delay is
+  // user-configurable in Settings; `null` disables auto-lock entirely ("Never"),
+  // keeping the vault open until manual lock / Quit.
   $effect(() => {
     if (vault.phase !== "unlocked") return;
+    const idleMs = tweaks.t.autoLockMs; // reactive: re-arms when the setting changes
+    if (idleMs == null) return; // "Never" — no idle timer at all
     let timer: ReturnType<typeof setTimeout>;
     const reset = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => void vault.lock().catch(() => {}), IDLE_LOCK_MS);
+      timer = setTimeout(() => void vault.lock().catch(() => {}), idleMs);
     };
     const events = ["mousemove", "mousedown", "keydown", "scroll", "touchstart"] as const;
     for (const e of events) window.addEventListener(e, reset, { passive: true });

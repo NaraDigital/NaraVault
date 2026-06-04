@@ -5,6 +5,8 @@ export interface Tweaks {
   radius: number;
   theme: "dark" | "light";
   variant: "console" | "refined";
+  /** Idle auto-lock delay in ms. `null` = never auto-lock (vault stays open). */
+  autoLockMs: number | null;
 }
 
 const KEY = "naravault.tweaks.v1";
@@ -15,6 +17,7 @@ const DEFAULTS: Tweaks = {
   radius: 10,
   theme: "dark",
   variant: "console",
+  autoLockMs: 5 * 60 * 1000,
 };
 
 const FONT_PAIRS: Record<Tweaks["fontPair"], { ui: string; mono: string }> = {
