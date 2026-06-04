@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "NaraVault Autofill",
+  "version": "1.0.0",
+  "description": "Autofill logins and TOTP codes from your local NaraVault. Secrets never leave your machine.",
+  "minimum_chrome_version": "102",
+  "permissions": ["nativeMessaging", "activeTab", "scripting", "tabs"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "NaraVault Autofill",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon128.png",
+      "48": "icons/icon128.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon128.png",
+    "48": "icons/icon128.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

@@ -1,0 +1,635 @@
+<script lang="ts">
+  import { onMount } from "svelte";
+  import Button from "../components/Button.svelte";
+  import { tweaks } from "../lib/tweaks.svelte";
+  import { parseBitwardenExport } from "../lib/import-bitwarden";
+  import { vault } from "../lib/vault.svelte";
+  import { toasts } from "../lib/toast.svelte";
+  import { confirm } from "../lib/confirm.svelte";
+  import { api, type S3Config } from "../lib/api";
+
+  interface Props {
+    count: number;
+    onlock: () => Promise<void> | void;
+    onreset: () => Promise<void> | void;
+    onchangeMaster: () => void;
+  }
+  let { count, onlock, onreset, onchangeMaster }: Props = $props();
+
+  let busy = $state<"" | "lock" | "reset" | "import" | "s3-save" | "s3-test" | "s3-export" | "s3-import">("");
+
+  async function run(kind: "lock" | "reset", fn: () => Promise<void> | void) {
+    if (busy) return;
+    busy = kind;
+    try {
+      await fn();
+    } finally {
+      busy = "";
+    }
+  }
+
+  let fileInput: HTMLInputElement | undefined = $state();
+
+  function triggerImport() {
+    if (busy) return;
+    fileInput?.click();
+  }
+
+  async function handleFileChange(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    // Reset input so the same file can be re-selected later
+    input.value = "";
+    if (!file) return;
+
+    busy = "import";
+    try {
+      const text = await file.text();
+      let json: unknown;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        toasts.push("Import failed: file is not valid JSON.", "close");
+        return;
+      }
+
+      const { items, skipped } = parseBitwardenExport(json);
+
+      for (const item of items) {
+        await vault.save(item);
+      }
+
+      const skippedNote = skipped > 0 ? ` (${skipped} skipped)` : "";
+      toasts.push(`Imported ${items.length} items${skippedNote}.`, "check");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error.";
+      toasts.push(`Import failed: ${msg}`, "close");
+    } finally {
+      busy = "";
+    }
+  }
+
+  // S3 / Cloud backup state
+  let s3 = $state<S3Config>({
+    endpoint: "",
+    access_key_id: "",
+    secret_access_key: "",
+    bucket: "",
+    region: "",
+  });
+  let showSecret = $state(false);
+
+  onMount(async () => {
+    try {
+      const saved = await api.loadS3Config();
+      if (saved) s3 = saved;
+    } catch {
+      // Not configured yet — leave defaults
+    }
+  });
+
+  /** Extract a readable message from any thrown value (Tauri errors are plain objects). */
+  function errMsg(err: unknown): string {
+    if (typeof err === "string") return err;
+    if (err instanceof Error) return err.message;
+    // Tauri IPC errors: { code: string; message: string }
+    const e = err as { message?: string };
+    return e?.message ?? JSON.stringify(err);
+  }
+
+  async function saveS3Config() {
+    if (busy) return;
+    busy = "s3-save";
+    try {
+      await api.saveS3Config(s3);
+      toasts.push("Cloud backup settings saved.", "check");
+    } catch (err) {
+      toasts.push(`Save failed: ${errMsg(err)}`, "close");
+    } finally {
+      busy = "";
+    }
+  }
+
+  async function testS3Connection() {
+    if (busy) return;
+    busy = "s3-test";
+    try {
+      await api.testS3Connection();
+      toasts.push("Connection successful.", "check");
+    } catch (err) {
+      toasts.push(`Connection failed: ${errMsg(err)}`, "close");
+    } finally {
+      busy = "";
+    }
+  }
+
+  // Export modal state
+  let exportModal = $state(false);
+  let exportFilename = $state("");
+  let exportPassword = $state("");
+
+  function openExportModal() {
+    if (busy) return;
+    exportFilename = "";
+    exportPassword = "";
+    exportModal = true;
+  }
+
+  function closeExportModal() {
+    exportModal = false;
+    exportFilename = "";
+    exportPassword = "";
+  }
+
+  async function submitExport() {
+    if (!exportFilename.trim()) {
+      toasts.push("Please enter a filename.", "close");
+      return;
+    }
+    if (!exportPassword) {
+      toasts.push("Please enter a password for this backup file.", "close");
+      return;
+    }
+    const filename = exportFilename.trim();
+    const password = exportPassword;
+    closeExportModal();
+    busy = "s3-export";
+    try {
+      const count = await api.exportToS3(filename, password);
+      toasts.push(`Export successful — ${count} items saved to ${filename}.nvb.`, "check");
+    } catch (err) {
+      toasts.push(`Export failed: ${errMsg(err)}`, "close");
+    } finally {
+      busy = "";
+    }
+  }
+
+  // Import modal state
+  let importModal = $state(false);
+  let importFiles = $state<string[]>([]);
+  let importLoading = $state(false);
+  let importSelected = $state("");
+  let importPassword = $state("");
+
+  async function openImportModal() {
+    if (busy) return;
+    importPassword = "";
+    importFiles = [];
+    importSelected = "";
+    importModal = true;
+    importLoading = true;
+    try {
+      const files = await api.listS3Backups();
+      importFiles = files;
+      importSelected = files[0] ?? "";
+    } catch (err) {
+      toasts.push(`Failed to list backups: ${errMsg(err)}`, "close");
+      importModal = false;
+    } finally {
+      importLoading = false;
+    }
+  }
+
+  function closeImportModal() {
+    importModal = false;
+    importFiles = [];
+    importSelected = "";
+    importPassword = "";
+    importLoading = false;
+  }
+
+  async function submitImport() {
+    if (!importSelected) {
+      toasts.push("Please select a backup file.", "close");
+      return;
+    }
+    if (!importPassword) {
+      toasts.push("Please enter the password for this backup file.", "close");
+      return;
+    }
+    const filename = importSelected;
+    const password = importPassword;
+    closeImportModal();
+    busy = "s3-import";
+    try {
+      const count = await api.importFromS3(filename, password);
+      await vault.reloadItems();
+      toasts.push(`Imported ${count} items from ${filename}.nvb.`, "check");
+    } catch (err) {
+      toasts.push(`Import failed: ${errMsg(err)}`, "close");
+    } finally {
+      busy = "";
+    }
+  }
+</script>
+
+<div class="settings">
+  <div class="settings-head">
+    <h2>Settings</h2>
+    <span class="detail-sub mono">{count} items protected</span>
+  </div>
+
+  <div class="set-group">
+    <span class="set-group-label mono">APPEARANCE</span>
+    <div class="set-row">
+      <div><strong>Theme</strong><span class="set-desc">Switch between dark and light.</span></div>
+      <div class="seg">
+        <button
+          class="seg-opt{tweaks.t.theme === 'dark' ? ' is-active' : ''}"
+          onclick={() => tweaks.set("theme", "dark")}>Dark</button
+        >
+        <button
+          class="seg-opt{tweaks.t.theme === 'light' ? ' is-active' : ''}"
+          onclick={() => tweaks.set("theme", "light")}>Light</button
+        >
+      </div>
+    </div>
+  </div>
+
+  <div class="set-group">
+    <span class="set-group-label mono">DATA</span>
+    <div class="set-row">
+      <div>
+        <strong>Import from Bitwarden</strong><span class="set-desc"
+          >Load items from an unencrypted Bitwarden JSON export.</span
+        >
+      </div>
+      <Button
+        variant="ghost"
+        icon="refresh"
+        loading={busy === "import"}
+        disabled={busy !== ""}
+        onclick={triggerImport}>Import</Button
+      >
+    </div>
+  </div>
+
+  <div class="set-group">
+    <span class="set-group-label mono">CLOUD BACKUP</span>
+    <div class="set-row set-row--col">
+      <div>
+        <strong>S3 / Cloudflare R2</strong>
+        <span class="set-desc">Encrypted backup to your own cloud storage. Items are encrypted with your vault key before upload.</span>
+      </div>
+      <div class="s3-form">
+        <label class="s3-label" for="s3-endpoint">Endpoint URL <span class="s3-hint">(leave blank for AWS S3)</span></label>
+        <input
+          id="s3-endpoint"
+          class="s3-input"
+          type="url"
+          placeholder="https://&lt;account&gt;.r2.cloudflarestorage.com"
+          bind:value={s3.endpoint}
+          disabled={busy !== ""}
+        />
+
+        <label class="s3-label" for="s3-access-key">Access Key ID</label>
+        <input
+          id="s3-access-key"
+          class="s3-input"
+          type="text"
+          placeholder="Access key ID"
+          bind:value={s3.access_key_id}
+          disabled={busy !== ""}
+        />
+
+        <label class="s3-label" for="s3-secret">Secret Access Key</label>
+        <div class="s3-secret-wrap">
+          <input
+            id="s3-secret"
+            class="s3-input s3-input--secret"
+            type={showSecret ? "text" : "password"}
+            placeholder="Secret access key"
+            bind:value={s3.secret_access_key}
+            disabled={busy !== ""}
+          />
+          <button
+            class="s3-reveal"
+            type="button"
+            onclick={() => (showSecret = !showSecret)}
+            aria-label={showSecret ? "Hide secret" : "Show secret"}
+          >{showSecret ? "Hide" : "Show"}</button>
+        </div>
+
+        <label class="s3-label" for="s3-bucket">Bucket</label>
+        <input
+          id="s3-bucket"
+          class="s3-input"
+          type="text"
+          placeholder="my-naravault-backup"
+          bind:value={s3.bucket}
+          disabled={busy !== ""}
+        />
+
+        <label class="s3-label" for="s3-region">Region</label>
+        <input
+          id="s3-region"
+          class="s3-input"
+          type="text"
+          placeholder="auto (R2) or ap-southeast-1 (AWS)"
+          bind:value={s3.region}
+          disabled={busy !== ""}
+        />
+
+        <div class="s3-actions">
+          <Button
+            variant="ghost"
+            icon="check"
+            loading={busy === "s3-save"}
+            disabled={busy !== ""}
+            onclick={saveS3Config}>Save</Button
+          >
+          <Button
+            variant="ghost"
+            icon="refresh"
+            loading={busy === "s3-test"}
+            disabled={busy !== ""}
+            onclick={testS3Connection}>Test Connection</Button
+          >
+          <Button
+            variant="ghost"
+            icon="refresh"
+            loading={busy === "s3-export"}
+            disabled={busy !== ""}
+            onclick={openExportModal}>Export to S3</Button
+          >
+          <Button
+            variant="ghost"
+            icon="refresh"
+            loading={busy === "s3-import"}
+            disabled={busy !== ""}
+            onclick={openImportModal}>Import from S3</Button
+          >
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {#if exportModal}
+    <div class="s3-pw-overlay" role="dialog" aria-modal="true">
+      <div class="s3-pw-card">
+        <p class="s3-pw-title">Export to S3</p>
+        <p class="s3-pw-desc">Choose a filename and set a password to encrypt this backup file. The password is specific to this file — not your master password.</p>
+        <label class="s3-label" for="export-filename">Filename</label>
+        <input
+          id="export-filename"
+          class="s3-pw-input"
+          type="text"
+          placeholder="backup-juni-2025"
+          bind:value={exportFilename}
+          onkeydown={(e) => { if (e.key === "Enter") submitExport(); if (e.key === "Escape") closeExportModal(); }}
+        />
+        <label class="s3-label" for="export-password">File password</label>
+        <input
+          id="export-password"
+          class="s3-pw-input"
+          type="password"
+          placeholder="Password for this backup file"
+          bind:value={exportPassword}
+          onkeydown={(e) => { if (e.key === "Enter") submitExport(); if (e.key === "Escape") closeExportModal(); }}
+        />
+        <div class="s3-pw-btns">
+          <Button variant="ghost" onclick={closeExportModal}>Cancel</Button>
+          <Button variant="primary" onclick={submitExport} disabled={!exportFilename.trim() || !exportPassword}>Export</Button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if importModal}
+    <div class="s3-pw-overlay" role="dialog" aria-modal="true">
+      <div class="s3-pw-card">
+        <p class="s3-pw-title">Import from S3</p>
+        {#if importLoading}
+          <p class="s3-pw-desc">Loading backup files...</p>
+        {:else if importFiles.length === 0}
+          <p class="s3-pw-desc">No backup files found in this bucket.</p>
+        {:else}
+          <p class="s3-pw-desc">Select a backup file and enter its password to restore items.</p>
+          <label class="s3-label" for="import-select">Backup file</label>
+          <select
+            id="import-select"
+            class="s3-select"
+            bind:value={importSelected}
+          >
+            {#each importFiles as f}
+              <option value={f}>{f}.nvb</option>
+            {/each}
+          </select>
+          <label class="s3-label" for="import-password">File password</label>
+          <input
+            id="import-password"
+            class="s3-pw-input"
+            type="password"
+            placeholder="Password for this backup file"
+            bind:value={importPassword}
+            onkeydown={(e) => { if (e.key === "Enter") submitImport(); if (e.key === "Escape") closeImportModal(); }}
+          />
+        {/if}
+        <div class="s3-pw-btns">
+          <Button variant="ghost" onclick={closeImportModal}>Cancel</Button>
+          <Button
+            variant="primary"
+            onclick={submitImport}
+            disabled={importLoading || importFiles.length === 0 || !importSelected || !importPassword}
+          >Import</Button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <div class="set-group">
+    <span class="set-group-label mono">SECURITY</span>
+    <div class="set-row">
+      <div>
+        <strong>Lock vault</strong><span class="set-desc">Require master password to reopen.</span>
+      </div>
+      <Button
+        variant="ghost"
+        icon="lock"
+        loading={busy === "lock"}
+        disabled={busy !== ""}
+        onclick={() => run("lock", onlock)}>Lock now</Button
+      >
+    </div>
+    <div class="set-row">
+      <div>
+        <strong>Change master password</strong><span class="set-desc"
+          >Update the key that protects everything.</span
+        >
+      </div>
+      <Button variant="ghost" icon="key" disabled={busy !== ""} onclick={onchangeMaster}>Change</Button>
+    </div>
+  </div>
+
+  <div class="set-group danger-group">
+    <span class="set-group-label mono">DANGER ZONE</span>
+    <div class="set-row">
+      <div>
+        <strong>Reset vault</strong><span class="set-desc"
+          >Permanently delete all items and the master password.</span
+        >
+      </div>
+      <Button
+        variant="danger"
+        icon="trash"
+        loading={busy === "reset"}
+        disabled={busy !== ""}
+        onclick={() => run("reset", onreset)}>Reset</Button
+      >
+    </div>
+  </div>
+
+  <!-- Hidden file picker — triggered programmatically by the Import button -->
+  <input
+    bind:this={fileInput}
+    type="file"
+    accept=".json,application/json"
+    style="display:none"
+    onchange={handleFileChange}
+  />
+</div>
+
+<style>
+  .set-row--col {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .s3-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .s3-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-top: 6px;
+  }
+
+  .s3-hint {
+    font-weight: 400;
+    color: var(--text-faint);
+  }
+
+  .s3-input {
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 13px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    outline: none;
+    box-sizing: border-box;
+  }
+
+  .s3-input:focus {
+    border-color: var(--accent);
+  }
+
+  .s3-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .s3-secret-wrap {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .s3-input--secret {
+    flex: 1;
+    width: auto;
+  }
+
+  .s3-reveal {
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .s3-reveal:hover {
+    color: var(--text);
+  }
+
+  .s3-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  /* Password prompt overlay for backup / restore */
+  .s3-pw-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: grid;
+    place-items: center;
+    z-index: 200;
+  }
+  .s3-pw-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .s3-pw-title {
+    font-weight: 700;
+    font-size: 15px;
+    margin: 0;
+  }
+  .s3-pw-desc {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin: 0;
+  }
+  .s3-pw-input {
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 13px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    outline: none;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+  }
+  .s3-pw-input:focus { border-color: var(--accent); }
+  .s3-select {
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 13px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    outline: none;
+    box-sizing: border-box;
+    cursor: pointer;
+  }
+  .s3-select:focus {
+    border-color: var(--accent);
+  }
+  .s3-pw-btns {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
+  }
+</style>

@@ -1,0 +1,32 @@
+# Dependencies
+node_modules
+dist
+dist-ssr
+
+# Tauri / Rust
+src-tauri/target
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+
+# Local data (never commit a real vault)
+*.naravault.db
+.ai-agent/
+bun.lock
+
+# Environment / secrets (safety net)
+.env
+.env.*
+.env.local
+*.nvb
+
+# Design files (not for public repo)
+.design/
+.design/

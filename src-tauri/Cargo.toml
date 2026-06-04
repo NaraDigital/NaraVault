@@ -1,0 +1,63 @@
+[package]
+name = "naravault"
+version = "1.1.0"
+description = "NaraVault — offline-first, zero-knowledge password manager"
+authors = ["NaraVault Team"]
+edition = "2021"
+rust-version = "1.77"
+default-run = "naravault"
+
+[lib]
+name = "naravault_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Native-messaging host: a thin stdio<->loopback relay launched by the browser.
+# It never holds the DEK and never decrypts — it only forwards JSON to the
+# running main app's loopback bridge. Uses std + serde_json only (no Tauri).
+[[bin]]
+name = "naravault-host"
+path = "src/bin/naravault-host.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-shell = "2"   # open external URLs in the OS browser, not the webview
+tauri-plugin-global-shortcut = "2"   # Alt+N quick launcher hotkey (desktop)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- Persistence ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- Cryptography (secure-first core) ---
+argon2 = "0.5"            # Argon2id key derivation
+aes-gcm = "0.10"          # AES-256-GCM authenticated encryption
+getrandom = "0.2"         # OS CSPRNG for salts / nonces / DEK
+zeroize = { version = "1", features = ["derive"] }
+region = "3"              # lock the in-memory key out of swap (VirtualLock/mlock)
+hmac = "0.12"             # HMAC for RFC-6238 TOTP autofill codes
+sha1 = "0.10"             # SHA-1 inner hash for TOTP
+subtle = "2"              # constant-time comparison for the bridge auth token
+
+# --- Browser-extension bridge (loopback only, 127.0.0.1) ---
+tiny_http = "0.12"        # minimal blocking HTTP server for the autofill bridge
+psl = "2"                 # embedded Mozilla Public Suffix List for safe origin matching
+
+# --- Cloud backup (S3 / Cloudflare R2) ---
+aws-sdk-s3 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-config = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+# --- Errors ---
+thiserror = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
