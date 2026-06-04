@@ -46,6 +46,13 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
+        // Single-instance guard MUST be the first plugin: a second launch (e.g. the
+        // user reopening NaraVault from Windows search) runs this callback in the
+        // ORIGINAL process and then exits, instead of spawning another tray icon.
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }));
+
         use tauri_plugin_global_shortcut::ShortcutState;
         builder = builder.plugin(
             tauri_plugin_global_shortcut::Builder::new()

@@ -1,6 +1,6 @@
 [package]
 name = "naravault"
-version = "1.1.0"
+version = "1.1.1"
 description = "NaraVault — offline-first, zero-knowledge password manager"
 authors = ["NaraVault Team"]
 edition = "2021"
@@ -26,6 +26,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-shell = "2"   # open external URLs in the OS browser, not the webview
 tauri-plugin-global-shortcut = "2"   # Alt+N quick launcher hotkey (desktop)
+tauri-plugin-single-instance = "2"   # keep one process: reopening focuses the existing window
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

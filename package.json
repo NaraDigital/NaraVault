@@ -1,6 +1,6 @@
 {
   "name": "naravault",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "NaraVault — offline-first, zero-knowledge password manager",
   "type": "module",
   "scripts": {
