@@ -88,6 +88,50 @@
     region: "",
   });
   let showSecret = $state(false);
+  // Revealing the S3 secret requires re-entering the master password, so a
+  // bystander at an already-unlocked vault can't read stored cloud credentials.
+  let showPrompt = $state(false);
+  let promptPw = $state("");
+  let promptErr = $state("");
+  let promptBusy = $state(false);
+
+  function toggleSecret() {
+    if (showSecret) {
+      // Hiding never needs a password.
+      showSecret = false;
+      return;
+    }
+    // Revealing → ask for the master password first.
+    promptPw = "";
+    promptErr = "";
+    showPrompt = true;
+  }
+
+  async function confirmReveal() {
+    if (promptBusy) return;
+    if (!promptPw) {
+      promptErr = "Enter your master password.";
+      return;
+    }
+    promptBusy = true;
+    promptErr = "";
+    try {
+      await api.verifyMaster(promptPw);
+      showSecret = true;
+      showPrompt = false;
+      promptPw = "";
+    } catch {
+      promptErr = "Wrong password";
+    } finally {
+      promptBusy = false;
+    }
+  }
+
+  function cancelReveal() {
+    showPrompt = false;
+    promptPw = "";
+    promptErr = "";
+  }
 
   onMount(async () => {
     try {
@@ -315,10 +359,31 @@
           <button
             class="s3-reveal"
             type="button"
-            onclick={() => (showSecret = !showSecret)}
+            onclick={toggleSecret}
+            disabled={busy !== ""}
             aria-label={showSecret ? "Hide secret" : "Show secret"}
           >{showSecret ? "Hide" : "Show"}</button>
         </div>
+
+        {#if showPrompt}
+          <div class="reveal-prompt">
+            <input
+              class="s3-input"
+              type="password"
+              placeholder="Master password to reveal"
+              bind:value={promptPw}
+              disabled={promptBusy}
+              onkeydown={(e) => { if (e.key === "Enter") confirmReveal(); if (e.key === "Escape") cancelReveal(); }}
+            />
+            <div class="reveal-actions">
+              <Button variant="ghost" onclick={cancelReveal} disabled={promptBusy}>Cancel</Button>
+              <Button variant="primary" onclick={confirmReveal} loading={promptBusy} disabled={promptBusy}>Confirm</Button>
+            </div>
+            {#if promptErr}
+              <span class="reveal-err">{promptErr}</span>
+            {/if}
+          </div>
+        {/if}
 
         <label class="s3-label" for="s3-bucket">Bucket</label>
         <input
@@ -668,6 +733,26 @@
   }
   .set-select:focus {
     border-color: var(--accent);
+  }
+  .reveal-prompt {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+    padding: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .reveal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .reveal-err {
+    font-size: 12px;
+    color: var(--danger, #e5484d);
+    font-weight: 600;
   }
   .s3-pw-btns {
     display: flex;

@@ -89,14 +89,20 @@ pub fn run() {
                 bridge::start(app.handle().clone(), handshake_path);
             }
 
-            // Register the global Alt+N hotkey for the quick launcher.
-            // Non-fatal: another app may already hold this shortcut.
+            // Register the global quick-launcher hotkey. Cmd+N on macOS (Alt+N
+            // collides with system shortcuts there and never fires), Alt+N on
+            // Windows/Linux. Non-fatal: another app may already hold this combo.
             #[cfg(desktop)]
             {
                 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
-                let alt_n = Shortcut::new(Some(Modifiers::ALT), Code::KeyN);
-                if let Err(e) = app.global_shortcut().register(alt_n) {
-                    eprintln!("[naravault] Alt+N shortcut registration failed (non-fatal): {e}");
+                #[cfg(target_os = "macos")]
+                let modifier = Modifiers::SUPER; // Cmd on macOS
+                #[cfg(not(target_os = "macos"))]
+                let modifier = Modifiers::ALT;
+                let combo = if cfg!(target_os = "macos") { "Cmd+N" } else { "Alt+N" };
+                let hotkey = Shortcut::new(Some(modifier), Code::KeyN);
+                if let Err(e) = app.global_shortcut().register(hotkey) {
+                    eprintln!("[naravault] {combo} shortcut registration failed (non-fatal): {e}");
                 }
             }
 
@@ -194,6 +200,23 @@ pub fn run() {
             commands::import_from_s3,
             commands::delete_items,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running NaraVault");
+        .build(tauri::generate_context!())
+        .expect("error while running NaraVault")
+        .run(|app, event| {
+            // macOS: clicking the Dock icon while every window is hidden (the
+            // case after the user closes the window — which hides to tray rather
+            // than quits) fires Reopen but no WindowEvent, so the app would seem
+            // dead from the Dock/taskbar. Bring the main window back to front.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    show_main(app);
+                }
+            }
+            // Silence unused-variable warnings on platforms without Reopen.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app, event);
+            }
+        });
 }
