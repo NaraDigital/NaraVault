@@ -96,6 +96,30 @@
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  // Like setValue but also handles <select> (expiry month/year dropdowns), where
+  // the native value setter doesn't apply.
+  function setAnyValue(el, value) {
+    if (!el || value == null) return;
+    if (el.tagName === "SELECT") {
+      el.focus();
+      el.value = String(value);
+      if (el.value !== String(value)) {
+        const want = String(value).toLowerCase();
+        const opt = [...el.options].find(
+          (o) =>
+            o.value.toLowerCase() === want ||
+            o.text.trim().toLowerCase() === want ||
+            o.value.toLowerCase().endsWith(want),
+        );
+        if (opt) el.value = opt.value;
+      }
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
+    setValue(el, value);
+  }
+
   async function fillItem(id, anchorPw) {
     const resp = await send("fill", { id });
     if (resp.state !== "ok") {
@@ -124,6 +148,80 @@
     } else {
       toast("Login filled");
     }
+  }
+
+  /* ----------------------- credit-card detection --------------------- */
+
+  function acToken(el) {
+    return (el.getAttribute("autocomplete") || "").toLowerCase();
+  }
+  function fieldHay(el) {
+    return `${el.name || ""} ${el.id || ""} ${el.getAttribute("placeholder") || ""} ${
+      el.getAttribute("aria-label") || ""
+    }`.toLowerCase();
+  }
+
+  // Locate the credit-card fields on the page (autocomplete tokens first, then
+  // name/id/placeholder heuristics). Any field may be absent.
+  function detectCardFields() {
+    const inputs = [...document.querySelectorAll("input, select")].filter(isVisible);
+    const byAc = (tok) => inputs.find((el) => acToken(el).includes(tok));
+    const byRe = (re) => inputs.find((el) => re.test(fieldHay(el)));
+
+    const number =
+      byAc("cc-number") || byRe(/card.?number|cardnum|ccnum|credit.?card|\bpan\b/);
+    const name =
+      byAc("cc-name") || byAc("cc-given-name") || byRe(/card.?holder|name.?on.?card|cc.?name/);
+    const cvv = byAc("cc-csc") || byRe(/cvv|cvc|csc|security.?code|card.?code/);
+    const expMonth = byAc("cc-exp-month") || byRe(/exp.?month|expmonth|exp.?mm/);
+    const expYear = byAc("cc-exp-year") || byRe(/exp.?year|expyear|exp.?yy/);
+    let expFull = byAc("cc-exp") || byRe(/(card.?)?exp(iry|iration)?(.?date)?/);
+    if (expFull && (expFull === expMonth || expFull === expYear)) expFull = null;
+    return { number, name, cvv, expFull, expMonth, expYear };
+  }
+
+  function hasCardForm() {
+    const f = detectCardFields();
+    return !!(f.number || f.expFull || (f.cvv && f.name));
+  }
+
+  async function fillCard(id) {
+    if (!hasCardForm()) {
+      toast("No card fields detected on this page");
+      return;
+    }
+    const resp = await send("fill", { id });
+    if (resp.state !== "ok") {
+      toast(messageFor(resp.state));
+      return;
+    }
+    const c = resp.body;
+    if (!c || c.type !== "card") {
+      toast("Couldn't fill card");
+      return;
+    }
+    const f = detectCardFields();
+    const digits = String(c.number || "").replace(/\D/g, "");
+    if (f.number) setAnyValue(f.number, digits);
+    if (f.name && c.holder) setAnyValue(f.name, c.holder);
+    if (f.cvv && c.cvv) setAnyValue(f.cvv, c.cvv);
+
+    const m = String(c.expiry || "").match(/(\d{1,2})\s*\/\s*(\d{2,4})/);
+    if (f.expFull) {
+      setAnyValue(f.expFull, c.expiry || "");
+    } else if (m) {
+      const mm = m[1].padStart(2, "0");
+      const yyRaw = m[2];
+      const yy = yyRaw.length === 4 ? yyRaw.slice(-2) : yyRaw;
+      const yyyy = yyRaw.length === 2 ? "20" + yyRaw : yyRaw;
+      if (f.expMonth) setAnyValue(f.expMonth, mm);
+      if (f.expYear) {
+        // Try 4-digit first (common for <select>), fall back to 2-digit.
+        setAnyValue(f.expYear, yyyy);
+        if (!f.expYear.value) setAnyValue(f.expYear, yy);
+      }
+    }
+    toast("Card filled");
   }
 
   /* --------------------------- chooser menu -------------------------- */
@@ -211,6 +309,70 @@
     document.documentElement.appendChild(menuHost);
   }
 
+  // Card chooser: cards aren't origin-bound, so we list ALL saved cards and let
+  // the user pick. Picking one triggers a consent prompt in the app before the
+  // PAN/CVV is released.
+  async function openCardMenu(anchorEl) {
+    closeMenu();
+    const resp = await send("cards", {});
+
+    menuHost = document.createElement("div");
+    const shadow = menuHost.attachShadow({ mode: "closed" });
+    const rect = anchorEl.getBoundingClientRect();
+    const top = window.scrollY + rect.bottom + 6;
+    const left = window.scrollX + rect.left;
+
+    let inner;
+    if (resp.state === "ok" && resp.body.items && resp.body.items.length) {
+      inner = resp.body.items
+        .map((it) => {
+          const meta = [it.brand, it.last4 ? "•• " + it.last4 : ""]
+            .filter(Boolean)
+            .join("  ");
+          return `
+          <button class="row" data-id="${escapeHtml(it.id)}">
+            <span class="name">${escapeHtml(it.name || "Card")}</span>
+            <span class="user">${escapeHtml(meta || it.holder || "")}</span>
+          </button>`;
+        })
+        .join("");
+    } else if (resp.state === "ok") {
+      inner = `<div class="empty">${escapeHtml("No saved cards yet.")}</div>`;
+    } else {
+      inner = `<div class="empty">${escapeHtml(messageFor(resp.state, true))}</div>`;
+    }
+
+    shadow.innerHTML = `
+      <style>
+        .panel{position:absolute;z-index:2147483647;top:${top}px;left:${left}px;min-width:240px;
+          max-width:340px;background:#fff;color:#1c1d22;border:1px solid #e3e3e8;border-radius:12px;
+          box-shadow:0 12px 40px rgba(0,0,0,.18);overflow:hidden;font:13px/1.4 system-ui,sans-serif}
+        .head{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid #eee;
+          font-weight:600;font-size:12px;color:#555}
+        .head img{width:16px;height:16px;border-radius:4px}
+        .row{display:flex;flex-direction:column;gap:2px;width:100%;text-align:left;background:none;
+          border:0;padding:9px 12px;cursor:pointer}
+        .row:hover{background:#f3f3f7}
+        .name{font-weight:600}
+        .user{color:#777;font-size:12px}
+        .empty{padding:14px 12px;color:#777}
+      </style>
+      <div class="panel">
+        <div class="head"><img src="${ICON_URL}" alt=""/> NaraVault · Cards</div>
+        ${inner}
+      </div>`;
+
+    shadow.querySelectorAll(".row").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.getAttribute("data-id");
+        closeMenu();
+        fillCard(id);
+      });
+    });
+
+    document.documentElement.appendChild(menuHost);
+  }
+
   function messageFor(state, short) {
     switch (state) {
       case "locked":
@@ -220,7 +382,7 @@
       case "origin_mismatch":
         return "This site doesn't match the saved login.";
       case "not_found":
-        return "Saved login not found.";
+        return "Saved item not found.";
       default:
         return "No matching logins for this site.";
     }
@@ -228,10 +390,12 @@
 
   /* --------------------------- field badge --------------------------- */
 
-  // Add a clickable NaraVault key icon inside detected password fields.
-  function decorate(pwEl) {
-    if (decorated.has(pwEl)) return;
-    decorated.add(pwEl);
+  // Add a clickable NaraVault key icon inside a detected field. `opener` is the
+  // chooser to open on click (login menu for password fields, card menu for
+  // card-number fields).
+  function decorate(targetEl, opener) {
+    if (decorated.has(targetEl)) return;
+    decorated.add(targetEl);
 
     const badge = document.createElement("button");
     badge.type = "button";
@@ -245,11 +409,11 @@
     badge.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      openMenu(pwEl);
+      opener(targetEl);
     });
 
     function place() {
-      const r = pwEl.getBoundingClientRect();
+      const r = targetEl.getBoundingClientRect();
       if (r.width < 8) {
         badge.style.display = "none";
         return;
@@ -263,20 +427,34 @@
 
     window.addEventListener("scroll", place, { passive: true });
     window.addEventListener("resize", place, { passive: true });
-    pwEl.addEventListener("focus", place);
+    targetEl.addEventListener("focus", place);
   }
 
   function scan() {
-    passwordFields().forEach(decorate);
+    passwordFields().forEach((el) => decorate(el, openMenu));
+    const cardNum = detectCardFields().number;
+    if (cardNum) decorate(cardNum, openCardMenu);
   }
 
   /* ----------------------------- wiring ------------------------------ */
 
-  // Popup can ask us to fill a specific item it picked.
+  // Popup can ask us to fill a specific item it picked, or report whether this
+  // page has a card form (so the popup can show/hide its "Fill here" affordance).
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg && msg.cmd === "fillFromPopup") {
+    if (!msg) return false;
+    if (msg.cmd === "fillFromPopup") {
       fillItem(msg.id, passwordFields()[0]);
       sendResponse({ ok: true });
+      return false;
+    }
+    if (msg.cmd === "fillCardFromPopup") {
+      fillCard(msg.id);
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (msg.cmd === "hasCardForm") {
+      sendResponse({ ok: true, hasCardForm: hasCardForm() });
+      return false;
     }
     return false;
   });

@@ -78,11 +78,15 @@ fn handle(msg: &Value) -> Value {
         None => return json!({ "ok": false, "error": "app_not_running" }),
     };
 
-    let (path, body): (&str, Value) = match kind {
-        "status" => ("/status", json!({})),
+    // Endpoints that may park on a user-consent prompt in the app need a generous
+    // read timeout; pure metadata calls fail fast so a hung app doesn't stall the
+    // popup. (timeout in seconds)
+    let (path, body, timeout): (&str, Value, u64) = match kind {
+        "status" => ("/status", json!({}), 5),
         "match" => (
             "/match",
             json!({ "origin": msg.get("origin").and_then(Value::as_str).unwrap_or("") }),
+            5,
         ),
         "fill" => (
             "/fill",
@@ -90,11 +94,54 @@ fn handle(msg: &Value) -> Value {
                 "id": msg.get("id").and_then(Value::as_str).unwrap_or(""),
                 "origin": msg.get("origin").and_then(Value::as_str).unwrap_or(""),
             }),
+            35,
+        ),
+        "cards" => ("/cards", json!({}), 5),
+        "item" => (
+            "/item",
+            json!({ "id": msg.get("id").and_then(Value::as_str).unwrap_or("") }),
+            5,
+        ),
+        "create" => (
+            "/create",
+            json!({
+                "type": msg.get("itemType").and_then(Value::as_str).unwrap_or("login"),
+                "origin": msg.get("origin").and_then(Value::as_str).unwrap_or(""),
+                "name": msg.get("name").and_then(Value::as_str).unwrap_or(""),
+                "username": msg.get("username").and_then(Value::as_str).unwrap_or(""),
+                "password": msg.get("password").and_then(Value::as_str).unwrap_or(""),
+                "url": msg.get("url").and_then(Value::as_str).unwrap_or(""),
+                "totp": msg.get("totp").and_then(Value::as_str).unwrap_or(""),
+                "holder": msg.get("holder").and_then(Value::as_str).unwrap_or(""),
+                "number": msg.get("number").and_then(Value::as_str).unwrap_or(""),
+                "expiry": msg.get("expiry").and_then(Value::as_str).unwrap_or(""),
+                "cvv": msg.get("cvv").and_then(Value::as_str).unwrap_or(""),
+                "brand": msg.get("brand").and_then(Value::as_str).unwrap_or(""),
+            }),
+            65,
+        ),
+        "update" => (
+            "/update",
+            json!({
+                "id": msg.get("id").and_then(Value::as_str).unwrap_or(""),
+                "origin": msg.get("origin").and_then(Value::as_str).unwrap_or(""),
+                "name": msg.get("name").and_then(Value::as_str).unwrap_or(""),
+                "username": msg.get("username").and_then(Value::as_str).unwrap_or(""),
+                "password": msg.get("password").and_then(Value::as_str).unwrap_or(""),
+                "url": msg.get("url").and_then(Value::as_str).unwrap_or(""),
+                "totp": msg.get("totp").and_then(Value::as_str).unwrap_or(""),
+                "holder": msg.get("holder").and_then(Value::as_str).unwrap_or(""),
+                "number": msg.get("number").and_then(Value::as_str).unwrap_or(""),
+                "expiry": msg.get("expiry").and_then(Value::as_str).unwrap_or(""),
+                "cvv": msg.get("cvv").and_then(Value::as_str).unwrap_or(""),
+                "brand": msg.get("brand").and_then(Value::as_str).unwrap_or(""),
+            }),
+            65,
         ),
         _ => return json!({ "ok": false, "error": "unknown_request" }),
     };
 
-    match post(port, &token, path, &body.to_string()) {
+    match post(port, &token, path, &body.to_string(), timeout) {
         Ok((status, body)) => {
             let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             json!({ "ok": status >= 200 && status < 300, "status": status, "body": parsed })
@@ -138,9 +185,9 @@ fn app_data_dir() -> Option<PathBuf> {
 }
 
 /// Minimal HTTP/1.1 POST over a localhost TCP socket. Returns (status, body).
-fn post(port: u16, token: &str, path: &str, body: &str) -> io::Result<(u16, String)> {
+fn post(port: u16, token: &str, path: &str, body: &str, timeout: u64) -> io::Result<(u16, String)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     let request = format!(

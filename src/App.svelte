@@ -16,6 +16,7 @@
     id: number;
     origin: string;
     name: string;
+    kind?: "login" | "card";
   }
 
   vault.init().catch((e: unknown) => {
@@ -48,11 +49,25 @@
       // explicit Allow/Deny so a local process that only stole the bridge token
       // still can't silently dump the vault.
       listen<ConsentPayload>("naravault://autofill-consent", async (e) => {
-        const { id, origin, name } = e.payload;
+        const { id, origin, name, kind } = e.payload;
+        const what = kind === "card" ? "card" : "login";
         const ok = await confirm.ask({
           title: "Allow browser autofill?",
-          message: `Fill the login “${name}” into ${origin}? Only allow this if you just triggered autofill there.`,
+          message: `Fill the ${what} “${name}” into ${origin}? Only allow this if you just triggered autofill there.`,
           confirmLabel: "Allow autofill",
+        });
+        await api.autofillConsentReply(id, ok).catch(() => {});
+      }),
+      // Browser-save consent: the extension wants to WRITE (add or update) an
+      // item. A write is more sensitive than autofill, so it is never cached —
+      // every save asks here before anything is persisted to the vault.
+      listen<ConsentPayload>("naravault://autofill-save-consent", async (e) => {
+        const { id, origin, name } = e.payload;
+        const where = origin ? ` for ${origin}` : "";
+        const ok = await confirm.ask({
+          title: "Save to vault from browser?",
+          message: `Save “${name}”${where} to your vault? Only allow this if you just chose to save it from the NaraVault extension.`,
+          confirmLabel: "Save",
         });
         await api.autofillConsentReply(id, ok).catch(() => {});
       }),

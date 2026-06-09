@@ -14,6 +14,7 @@
 //! The native-messaging host (`naravault-host`) is the only intended client: it
 //! relays the browser extension's requests here over a raw localhost socket.
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
@@ -37,6 +38,29 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Fresh NaraVault-format primary key ("i_" + 8 random hex chars), matching the
+/// frontend's `newId()`. The id is the only plaintext field stored, carries no
+/// secret, and is generated app-side so the extension can never overwrite an
+/// existing item by id (a /create always inserts a brand-new row).
+fn random_id() -> String {
+    let mut buf = [0u8; 4];
+    if getrandom::getrandom(&mut buf).is_err() {
+        return format!("i_{:08x}", now_secs() as u32);
+    }
+    format!(
+        "i_{}",
+        buf.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    )
 }
 
 /// Generate the per-session bearer token from the OS CSPRNG. Returns `None` if
@@ -99,9 +123,9 @@ fn str_field<'a>(item: &'a Item, key: &str) -> &'a str {
     item.data.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// Decrypt every login item (requires the vault unlocked). Returns `None` when
+/// Decrypt every vault item (requires the vault unlocked). Returns `None` when
 /// locked so callers can answer 423 without distinguishing "empty" from "locked".
-fn load_logins(state: &AppState) -> Option<Vec<Item>> {
+fn load_all_items(state: &AppState) -> Option<Vec<Item>> {
     if !state.is_unlocked() {
         return None;
     }
@@ -115,13 +139,106 @@ fn load_logins(state: &AppState) -> Option<Vec<Item>> {
             for row in rows {
                 let plaintext = crypto::open(dek, &row.nonce, &row.ciphertext)?;
                 let item: Item = serde_json::from_slice(&plaintext)?;
-                if item.item_type == "login" {
-                    out.push(item);
-                }
+                out.push(item);
             }
             Ok(out)
         })
         .ok()
+}
+
+/// Just the login items, for the origin-matched autofill list.
+fn load_logins(state: &AppState) -> Option<Vec<Item>> {
+    Some(
+        load_all_items(state)?
+            .into_iter()
+            .filter(|it| it.item_type == "login")
+            .collect(),
+    )
+}
+
+/// Last 4 digits of a card number (digits only). Shown for display/disambiguation;
+/// the full PAN never leaves the app except via a consent-gated /fill.
+fn last4(num: &str) -> String {
+    let digits: String = num.chars().filter(char::is_ascii_digit).collect();
+    let n = digits.len();
+    if n >= 4 {
+        digits[n - 4..].to_string()
+    } else {
+        digits
+    }
+}
+
+fn data_str<'a>(data: &'a Value, key: &str) -> &'a str {
+    data.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Default display name when the user leaves the name blank (mirrors the desktop
+/// `defaultName()` in ItemForm.svelte).
+fn default_name(item_type: &str, data: &Value) -> String {
+    match item_type {
+        "login" => {
+            let url = data_str(data, "url");
+            if !url.is_empty() {
+                return url.to_string();
+            }
+            let user = data_str(data, "username");
+            if !user.is_empty() {
+                user.to_string()
+            } else {
+                "Login".to_string()
+            }
+        }
+        "card" => {
+            let brand = data_str(data, "brand");
+            let base = if brand.is_empty() {
+                "Card".to_string()
+            } else {
+                brand.to_string()
+            };
+            let l4 = last4(data_str(data, "number"));
+            if l4.is_empty() {
+                base
+            } else {
+                format!("{base} •• {l4}")
+            }
+        }
+        _ => "Item".to_string(),
+    }
+}
+
+/// Subtitle (`sub`) for an item, mirroring the desktop `subFor()`.
+fn sub_for(item_type: &str, data: &Value) -> String {
+    match item_type {
+        "login" => {
+            let user = data_str(data, "username");
+            if !user.is_empty() {
+                user.to_string()
+            } else {
+                data_str(data, "url").to_string()
+            }
+        }
+        "card" => data_str(data, "holder").to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Encrypt `item` under the live DEK and upsert it. Returns false on any failure
+/// (locked / lock poisoned / db error) so the caller can answer 5xx/423.
+fn persist_item(state: &AppState, item: &Item) -> bool {
+    let plaintext = match serde_json::to_vec(item) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let sealed = match state.with_dek(|dek| crypto::seal(dek, &plaintext)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match state.conn.lock() {
+        Ok(conn) => {
+            db::upsert_item(&conn, &item.id, &sealed.nonce, &sealed.ciphertext, now_ms()).is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 fn json_response(status: u16, body: Value) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -208,7 +325,14 @@ fn serve(app: tauri::AppHandle, server: Server, token: String) {
 
         let mut body = String::new();
         if matches!(method, Method::Post) {
-            let _ = request.as_reader().read_to_string(&mut body);
+            // Cap the body before buffering: every endpoint's payload is tiny
+            // (a few small fields), so a 32 KiB ceiling bounds memory even though
+            // the socket is already loopback + token-gated.
+            const MAX_BODY: u64 = 32 * 1024;
+            let _ = request
+                .as_reader()
+                .take(MAX_BODY)
+                .read_to_string(&mut body);
         }
         let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
 
@@ -226,6 +350,7 @@ fn request_consent(
     state: &AppState,
     origin_host: &str,
     item_name: &str,
+    kind: &str,
 ) -> bool {
     use tauri::{Emitter, Manager};
 
@@ -236,7 +361,7 @@ fn request_consent(
         let _ = main.set_focus();
         let _ = main.emit(
             "naravault://autofill-consent",
-            json!({ "id": id, "origin": origin_host, "name": item_name }),
+            json!({ "id": id, "origin": origin_host, "name": item_name, "kind": kind }),
         );
     } else {
         // No window to ask -> fail closed.
@@ -244,6 +369,34 @@ fn request_consent(
     }
     // Bounded wait: an ignored or dismissed prompt is treated as a denial.
     matches!(rx.recv_timeout(std::time::Duration::from_secs(30)), Ok(true))
+}
+
+/// Ask the user (in the main window) to approve SAVING a new login that the
+/// extension wants to write for `origin_host`. Unlike autofill consent this is
+/// never cached: every write prompts, so a local process holding the token can
+/// not silently pollute the vault. Returns true only on an explicit approval.
+fn request_save_consent(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    origin_host: &str,
+    item_name: &str,
+) -> bool {
+    use tauri::{Emitter, Manager};
+
+    let (id, rx) = state.register_consent();
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.unminimize();
+        let _ = main.set_focus();
+        let _ = main.emit(
+            "naravault://autofill-save-consent",
+            json!({ "id": id, "origin": origin_host, "name": item_name }),
+        );
+    } else {
+        return false;
+    }
+    // Give the user a bit longer for a write decision; a dismissed prompt denies.
+    matches!(rx.recv_timeout(std::time::Duration::from_secs(60)), Ok(true))
 }
 
 fn route(
@@ -272,72 +425,369 @@ fn route(
             )
         }
 
-        // Non-secret list of accounts that match the page origin: id + display
-        // name + username only. NEVER a password or TOTP.
+        // Non-secret login list, split by the page origin:
+        //   * `items`  — logins whose stored URL matches the page (autofillable here)
+        //   * `others` — every other login in the vault (shown for visibility /
+        //                editing; cross-origin fill stays blocked by /fill).
+        // id + display name + username only — NEVER a password or TOTP.
         "/match" => {
             let origin = body.get("origin").and_then(Value::as_str).unwrap_or("");
             match load_logins(state) {
                 None => json_response(423, json!({ "error": "locked" })),
                 Some(items) => {
-                    let matches: Vec<Value> = items
-                        .iter()
-                        .filter(|it| origin_matches(str_field(it, "url"), origin))
-                        .map(|it| {
-                            json!({
-                                "id": it.id,
-                                "name": it.name,
-                                "username": str_field(it, "username"),
-                                "hasTotp": !str_field(it, "totp").is_empty(),
-                            })
+                    let project = |it: &Item| {
+                        json!({
+                            "id": it.id,
+                            "name": it.name,
+                            "username": str_field(it, "username"),
+                            "hasTotp": !str_field(it, "totp").is_empty(),
                         })
-                        .collect();
-                    json_response(200, json!({ "items": matches }))
+                    };
+                    let mut matched = Vec::new();
+                    let mut others = Vec::new();
+                    for it in &items {
+                        if !origin.is_empty() && origin_matches(str_field(it, "url"), origin) {
+                            matched.push(project(it));
+                        } else {
+                            others.push(project(it));
+                        }
+                    }
+                    json_response(200, json!({ "items": matched, "others": others }))
                 }
             }
         }
 
-        // The actual secret hand-off. Requires unlocked + a verified origin match
-        // for the requested id, so one site can't exfiltrate another's login.
-        "/fill" => {
+        // Non-secret list of ALL cards (no origin binding — cards aren't tied to a
+        // site). id + display name + brand + last4 + holder + expiry only. NEVER
+        // the full PAN or CVV.
+        "/cards" => match load_all_items(state) {
+            None => json_response(423, json!({ "error": "locked" })),
+            Some(items) => {
+                let cards: Vec<Value> = items
+                    .iter()
+                    .filter(|it| it.item_type == "card")
+                    .map(|it| {
+                        json!({
+                            "id": it.id,
+                            "name": it.name,
+                            "brand": str_field(it, "brand"),
+                            "last4": last4(str_field(it, "number")),
+                            "holder": str_field(it, "holder"),
+                            "expiry": str_field(it, "expiry"),
+                        })
+                    })
+                    .collect();
+                json_response(200, json!({ "items": cards }))
+            }
+        },
+
+        // Non-secret projection of ONE item, used to pre-fill the edit form. Never
+        // returns a password / TOTP / PAN / CVV — only `hasX` flags so the form can
+        // show a "leave blank to keep" placeholder for secret fields.
+        "/item" => {
             let id = body.get("id").and_then(Value::as_str).unwrap_or("");
-            let origin = body.get("origin").and_then(Value::as_str).unwrap_or("");
-            match load_logins(state) {
+            match load_all_items(state) {
                 None => json_response(423, json!({ "error": "locked" })),
                 Some(items) => match items.iter().find(|it| it.id == id) {
                     None => json_response(404, json!({ "error": "not_found" })),
-                    Some(it) => {
-                        if !origin_matches(str_field(it, "url"), origin) {
-                            return json_response(403, json!({ "error": "origin_mismatch" }));
-                        }
-                        // M-A: app-side consent before any secret leaves the app.
-                        // First use per origin (this unlocked session) prompts the
-                        // user; a local process that merely stole the token still
-                        // can't dump secrets without the user clicking Allow.
-                        let host = host_of(origin);
-                        let key = registrable(&host).unwrap_or(host.clone());
-                        if !state.is_origin_approved(&key) {
-                            if !request_consent(app, state, &host, &it.name) {
-                                return json_response(403, json!({ "error": "consent_denied" }));
-                            }
-                            state.approve_origin(key);
-                        }
-                        let totp_secret = str_field(it, "totp");
-                        let totp_code = if totp_secret.is_empty() {
-                            String::new()
-                        } else {
-                            totp::code(totp_secret, now_secs()).unwrap_or_default()
-                        };
-                        json_response(
+                    Some(it) => match it.item_type.as_str() {
+                        "login" => json_response(
                             200,
                             json!({
+                                "type": "login",
+                                "name": it.name,
+                                "url": str_field(it, "url"),
                                 "username": str_field(it, "username"),
-                                "password": str_field(it, "password"),
-                                "totp": totp_code,
+                                "hasPassword": !str_field(it, "password").is_empty(),
+                                "hasTotp": !str_field(it, "totp").is_empty(),
                             }),
-                        )
-                    }
+                        ),
+                        "card" => json_response(
+                            200,
+                            json!({
+                                "type": "card",
+                                "name": it.name,
+                                "holder": str_field(it, "holder"),
+                                "expiry": str_field(it, "expiry"),
+                                "brand": str_field(it, "brand"),
+                                "last4": last4(str_field(it, "number")),
+                                "hasNumber": !str_field(it, "number").is_empty(),
+                                "hasCvv": !str_field(it, "cvv").is_empty(),
+                            }),
+                        ),
+                        _ => json_response(404, json!({ "error": "unsupported_type" })),
+                    },
                 },
             }
+        }
+
+        // The actual secret hand-off. Requires unlocked + consent.
+        //   * login: origin must match the stored URL (one site can't pull
+        //     another's login); consent is cached per-origin for the session.
+        //   * card: no origin binding, so consent is ALWAYS prompted (uncached) —
+        //     a PAN/CVV is high value and shouldn't fill silently after one Allow.
+        "/fill" => {
+            let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+            let origin = body.get("origin").and_then(Value::as_str).unwrap_or("");
+            let items = match load_all_items(state) {
+                None => return json_response(423, json!({ "error": "locked" })),
+                Some(v) => v,
+            };
+            let it = match items.iter().find(|it| it.id == id) {
+                None => return json_response(404, json!({ "error": "not_found" })),
+                Some(it) => it,
+            };
+            match it.item_type.as_str() {
+                "login" => {
+                    if !origin_matches(str_field(it, "url"), origin) {
+                        return json_response(403, json!({ "error": "origin_mismatch" }));
+                    }
+                    let host = host_of(origin);
+                    let key = registrable(&host).unwrap_or(host.clone());
+                    if !state.is_origin_approved(&key) {
+                        if !request_consent(app, state, &host, &it.name, "login") {
+                            return json_response(403, json!({ "error": "consent_denied" }));
+                        }
+                        state.approve_origin(key);
+                    }
+                    let totp_secret = str_field(it, "totp");
+                    let totp_code = if totp_secret.is_empty() {
+                        String::new()
+                    } else {
+                        totp::code(totp_secret, now_secs()).unwrap_or_default()
+                    };
+                    json_response(
+                        200,
+                        json!({
+                            "type": "login",
+                            "username": str_field(it, "username"),
+                            "password": str_field(it, "password"),
+                            "totp": totp_code,
+                        }),
+                    )
+                }
+                "card" => {
+                    let host = host_of(origin);
+                    if !request_consent(app, state, &host, &it.name, "card") {
+                        return json_response(403, json!({ "error": "consent_denied" }));
+                    }
+                    json_response(
+                        200,
+                        json!({
+                            "type": "card",
+                            "number": str_field(it, "number"),
+                            "holder": str_field(it, "holder"),
+                            "expiry": str_field(it, "expiry"),
+                            "cvv": str_field(it, "cvv"),
+                            "brand": str_field(it, "brand"),
+                        }),
+                    )
+                }
+                _ => json_response(404, json!({ "error": "not_found" })),
+            }
+        }
+
+        // Write path — INSERT a new login or card. Guards:
+        //   * 423 if locked.
+        //   * ALWAYS prompts the user in the app (uncached) before writing.
+        //   * Server generates a fresh id, so this can only INSERT, never clobber.
+        //   * No secret is read back to the extension.
+        "/create" => {
+            if !state.is_unlocked() {
+                return json_response(423, json!({ "error": "locked" }));
+            }
+            let origin = body.get("origin").and_then(Value::as_str).unwrap_or("");
+            let item_type = body
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("login")
+                .to_string();
+            let g = |k: &str| {
+                body.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let name_in = g("name").trim().to_string();
+            if name_in.len() > 200 {
+                return json_response(400, json!({ "error": "too_large" }));
+            }
+
+            let data = match item_type.as_str() {
+                "login" => {
+                    let password = g("password");
+                    if password.is_empty() {
+                        return json_response(400, json!({ "error": "invalid_input" }));
+                    }
+                    let username = g("username");
+                    let mut url = g("url").trim().to_string();
+                    if url.is_empty() {
+                        url = origin.trim().to_string();
+                    }
+                    let totp = g("totp").trim().to_string();
+                    if username.len() > 400
+                        || password.len() > 2000
+                        || url.len() > 2000
+                        || totp.len() > 512
+                    {
+                        return json_response(400, json!({ "error": "too_large" }));
+                    }
+                    json!({ "username": username, "password": password, "url": url, "totp": totp, "notes": "" })
+                }
+                "card" => {
+                    let number = g("number");
+                    if number.is_empty() {
+                        return json_response(400, json!({ "error": "invalid_input" }));
+                    }
+                    let holder = g("holder");
+                    let expiry = g("expiry").trim().to_string();
+                    let cvv = g("cvv").trim().to_string();
+                    let brand = g("brand").trim().to_string();
+                    if number.len() > 40
+                        || holder.len() > 200
+                        || expiry.len() > 16
+                        || cvv.len() > 8
+                        || brand.len() > 40
+                    {
+                        return json_response(400, json!({ "error": "too_large" }));
+                    }
+                    json!({ "holder": holder, "number": number, "expiry": expiry, "cvv": cvv, "brand": brand, "notes": "" })
+                }
+                _ => return json_response(400, json!({ "error": "unsupported_type" })),
+            };
+
+            let name = if name_in.is_empty() {
+                default_name(&item_type, &data)
+            } else {
+                name_in
+            };
+            let host = host_of(origin);
+            if !request_save_consent(app, state, &host, &name) {
+                return json_response(403, json!({ "error": "consent_denied" }));
+            }
+            let item = Item {
+                id: random_id(),
+                item_type: item_type.clone(),
+                name,
+                sub: sub_for(&item_type, &data),
+                fav: false,
+                data,
+            };
+            if !persist_item(state, &item) {
+                return json_response(500, json!({ "error": "save_failed" }));
+            }
+            {
+                use tauri::Emitter;
+                let _ = app.emit("naravault://vault-changed", ());
+            }
+            json_response(200, json!({ "ok": true, "id": item.id }))
+        }
+
+        // Write path — UPDATE an existing login or card by id. The existing item is
+        // decrypted server-side and merged: non-secret fields are overwritten from
+        // the request, but secret fields (password/totp, number/cvv) are kept
+        // UNLESS the request supplies a non-empty replacement. The extension never
+        // sees the old secret, and a blank secret field means "leave unchanged".
+        "/update" => {
+            if !state.is_unlocked() {
+                return json_response(423, json!({ "error": "locked" }));
+            }
+            let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() {
+                return json_response(400, json!({ "error": "invalid_input" }));
+            }
+            let origin = body.get("origin").and_then(Value::as_str).unwrap_or("");
+            let g = |k: &str| {
+                body.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+
+            let mut items = match load_all_items(state) {
+                None => return json_response(423, json!({ "error": "locked" })),
+                Some(v) => v,
+            };
+            let idx = match items.iter().position(|it| it.id == id) {
+                None => return json_response(404, json!({ "error": "not_found" })),
+                Some(i) => i,
+            };
+            let mut item = items.swap_remove(idx);
+            let mut data = item
+                .data
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            let set_secret_if_present = |data: &mut serde_json::Map<String, Value>, key: &str, v: String| {
+                if !v.is_empty() {
+                    data.insert(key.to_string(), Value::String(v));
+                }
+            };
+
+            match item.item_type.as_str() {
+                "login" => {
+                    let url = g("url");
+                    let username = g("username");
+                    if url.len() > 2000 || username.len() > 400 {
+                        return json_response(400, json!({ "error": "too_large" }));
+                    }
+                    data.insert("url".into(), Value::String(url));
+                    data.insert("username".into(), Value::String(username));
+                    let pw = g("password");
+                    let totp = g("totp").trim().to_string();
+                    if pw.len() > 2000 || totp.len() > 512 {
+                        return json_response(400, json!({ "error": "too_large" }));
+                    }
+                    set_secret_if_present(&mut data, "password", pw);
+                    set_secret_if_present(&mut data, "totp", totp);
+                }
+                "card" => {
+                    let holder = g("holder");
+                    let expiry = g("expiry").trim().to_string();
+                    let brand = g("brand").trim().to_string();
+                    if holder.len() > 200 || expiry.len() > 16 || brand.len() > 40 {
+                        return json_response(400, json!({ "error": "too_large" }));
+                    }
+                    data.insert("holder".into(), Value::String(holder));
+                    data.insert("expiry".into(), Value::String(expiry));
+                    data.insert("brand".into(), Value::String(brand));
+                    let number = g("number");
+                    let cvv = g("cvv").trim().to_string();
+                    if number.len() > 40 || cvv.len() > 8 {
+                        return json_response(400, json!({ "error": "too_large" }));
+                    }
+                    set_secret_if_present(&mut data, "number", number);
+                    set_secret_if_present(&mut data, "cvv", cvv);
+                }
+                _ => return json_response(400, json!({ "error": "unsupported_type" })),
+            }
+
+            let new_data = Value::Object(data);
+            let item_type = item.item_type.clone();
+            let name_in = g("name").trim().to_string();
+            if name_in.len() > 200 {
+                return json_response(400, json!({ "error": "too_large" }));
+            }
+            let name = if name_in.is_empty() {
+                default_name(&item_type, &new_data)
+            } else {
+                name_in
+            };
+            let host = host_of(origin);
+            if !request_save_consent(app, state, &host, &name) {
+                return json_response(403, json!({ "error": "consent_denied" }));
+            }
+            item.name = name;
+            item.sub = sub_for(&item_type, &new_data);
+            item.data = new_data;
+            if !persist_item(state, &item) {
+                return json_response(500, json!({ "error": "save_failed" }));
+            }
+            {
+                use tauri::Emitter;
+                let _ = app.emit("naravault://vault-changed", ());
+            }
+            json_response(200, json!({ "ok": true, "id": item.id }))
         }
 
         _ => json_response(404, json!({ "error": "not_found" })),

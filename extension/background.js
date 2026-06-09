@@ -49,6 +49,26 @@ function interpret(reply) {
   return { state: "error" };
 }
 
+// Collect the write fields shared by create + update. `itemType` is mapped to
+// the bridge body's `type` by the native host (the message-level `type` is the
+// host command name, so the item type travels under a different key).
+function buildWriteFields(msg) {
+  return {
+    itemType: msg.itemType || "login",
+    origin: msg.origin || "",
+    name: msg.name || "",
+    username: msg.username || "",
+    password: msg.password || "",
+    url: msg.url || "",
+    totp: msg.totp || "",
+    holder: msg.holder || "",
+    number: msg.number || "",
+    expiry: msg.expiry || "",
+    cvv: msg.cvv || "",
+    brand: msg.brand || "",
+  };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     switch (msg && msg.cmd) {
@@ -63,6 +83,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case "fill": {
         sendResponse(
           interpret(await callHost({ type: "fill", id: msg.id, origin: msg.origin })),
+        );
+        break;
+      }
+      case "cards": {
+        // Non-secret list of all cards (no PAN / CVV).
+        sendResponse(interpret(await callHost({ type: "cards" })));
+        break;
+      }
+      case "item": {
+        // Non-secret fields of one item, to pre-fill the edit form.
+        sendResponse(interpret(await callHost({ type: "item", id: msg.id })));
+        break;
+      }
+      case "create": {
+        // INSERT a new login or card. The app re-prompts the user before
+        // persisting; we just relay the fields. No secret is ever read back.
+        sendResponse(
+          interpret(await callHost({ type: "create", ...buildWriteFields(msg) })),
+        );
+        break;
+      }
+      case "update": {
+        // UPDATE an existing item by id. Blank secret fields = keep current.
+        sendResponse(
+          interpret(
+            await callHost({ type: "update", id: msg.id, ...buildWriteFields(msg) }),
+          ),
         );
         break;
       }
