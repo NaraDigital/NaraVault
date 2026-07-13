@@ -30,3 +30,4 @@ bun.lock
 # Design files (not for public repo)
 .design/
 .design/
+mobile_design/

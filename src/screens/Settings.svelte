@@ -133,6 +133,12 @@
     promptErr = "";
   }
 
+  // Browser-autofill consent prompt. true = the desktop app asks for approval on
+  // every login fill (secure default); false = fill silently (origin match +
+  // unlocked still enforced by the bridge). Cards always prompt regardless.
+  let autofillPrompt = $state(true);
+  let autofillBusy = $state(false);
+
   onMount(async () => {
     try {
       const saved = await api.loadS3Config();
@@ -140,7 +146,27 @@
     } catch {
       // Not configured yet — leave defaults
     }
+    try {
+      autofillPrompt = await api.getAutofillPrompt();
+    } catch {
+      // Locked or unset — keep secure default
+    }
   });
+
+  async function setAutofillPrompt(enabled: boolean) {
+    if (autofillBusy || enabled === autofillPrompt) return;
+    autofillBusy = true;
+    const prev = autofillPrompt;
+    autofillPrompt = enabled;
+    try {
+      await api.setAutofillPrompt(enabled);
+    } catch (err) {
+      autofillPrompt = prev;
+      toasts.push(`Couldn't update setting: ${errMsg(err)}`, "close");
+    } finally {
+      autofillBusy = false;
+    }
+  }
 
   /** Extract a readable message from any thrown value (Tauri errors are plain objects). */
   function errMsg(err: unknown): string {
@@ -535,6 +561,33 @@
     </div>
     <div class="set-row">
       <div>
+        <strong>Browser autofill approval</strong><span class="set-desc"
+          >Ask for confirmation in this app each time the extension fills a login or
+          card. Turn off to fill silently — for logins the origin still has to match,
+          and the vault must be unlocked either way.</span
+        >
+      </div>
+      <div class="seg">
+        <button
+          class="seg-opt{autofillPrompt ? ' is-active' : ''}"
+          disabled={autofillBusy}
+          onclick={() => setAutofillPrompt(true)}>Ask</button
+        >
+        <button
+          class="seg-opt{!autofillPrompt ? ' is-active' : ''}"
+          disabled={autofillBusy}
+          onclick={() => setAutofillPrompt(false)}>Off</button
+        >
+      </div>
+    </div>
+    {#if !autofillPrompt}
+      <div class="set-warn" role="note">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+        <span>Logins and cards can be filled without confirmation while the vault is unlocked. Anything running on this machine that reaches the autofill bridge can read your card details or a matching login silently. Lock the vault when you step away.</span>
+      </div>
+    {/if}
+    <div class="set-row">
+      <div>
         <strong>Lock vault</strong><span class="set-desc">Require master password to reopen.</span>
       </div>
       <Button
@@ -733,6 +786,24 @@
   }
   .set-select:focus {
     border-color: var(--accent);
+  }
+  .set-warn {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin-top: 10px;
+    padding: 10px 12px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: var(--text-dim);
+    background: color-mix(in srgb, var(--danger, #e5484d) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger, #e5484d) 35%, transparent);
+    border-radius: var(--radius);
+  }
+  .set-warn svg {
+    flex-shrink: 0;
+    margin-top: 1px;
+    color: var(--danger, #e5484d);
   }
   .reveal-prompt {
     display: flex;

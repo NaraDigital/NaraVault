@@ -146,6 +146,30 @@ fn load_all_items(state: &AppState) -> Option<Vec<Item>> {
         .ok()
 }
 
+/// Whether the desktop app should pop a per-fill consent prompt for autofill.
+/// Default `true` (the secure baseline). When the user opts out in Settings we
+/// store an encrypted `"0"`, letting autofill proceed silently while the vault
+/// is unlocked. This now covers BOTH logins (origin still must match) and cards
+/// (user explicitly opted in to loosen high-value fills too).
+fn autofill_prompt_enabled(state: &AppState) -> bool {
+    let row = {
+        let conn = match state.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return true,
+        };
+        match db::load_setting(&conn, crate::commands::AUTOFILL_PROMPT_KEY) {
+            Ok(Some(r)) => r,
+            _ => return true, // unset → secure default (prompt ON)
+        }
+    };
+    state
+        .with_dek(|dek| {
+            let plain = crypto::open(dek, &row.0, &row.1)?;
+            Ok(plain != b"0")
+        })
+        .unwrap_or(true)
+}
+
 /// Just the login items, for the origin-matched autofill list.
 fn load_logins(state: &AppState) -> Option<Vec<Item>> {
     Some(
@@ -544,7 +568,11 @@ fn route(
                     }
                     let host = host_of(origin);
                     let key = registrable(&host).unwrap_or(host.clone());
-                    if !state.is_origin_approved(&key) {
+                    // Per-fill consent is the secure default but can be disabled in
+                    // Settings. When disabled we still require the origin to match
+                    // the stored URL and the vault to be unlocked — we just skip the
+                    // interactive prompt.
+                    if autofill_prompt_enabled(state) && !state.is_origin_approved(&key) {
                         if !request_consent(app, state, &host, &it.name, "login") {
                             return json_response(403, json!({ "error": "consent_denied" }));
                         }
@@ -567,9 +595,15 @@ fn route(
                     )
                 }
                 "card" => {
-                    let host = host_of(origin);
-                    if !request_consent(app, state, &host, &it.name, "card") {
-                        return json_response(403, json!({ "error": "consent_denied" }));
+                    // Cards honor the same Settings toggle as logins. When the
+                    // prompt is enabled (default) we ask uncached every time;
+                    // when the user has opted out, card fills proceed silently
+                    // while unlocked.
+                    if autofill_prompt_enabled(state) {
+                        let host = host_of(origin);
+                        if !request_consent(app, state, &host, &it.name, "card") {
+                            return json_response(403, json!({ "error": "consent_denied" }));
+                        }
                     }
                     json_response(
                         200,

@@ -192,6 +192,8 @@ pub fn run() {
             commands::launcher_open_item,
             commands::autofill_consent_reply,
             commands::ping,
+            commands::get_autofill_prompt,
+            commands::set_autofill_prompt,
             commands::save_s3_config,
             commands::load_s3_config,
             commands::test_s3_connection,

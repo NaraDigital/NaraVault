@@ -49,6 +49,9 @@ export const api = {
 
   ping: () => invoke<string>("ping"),
 
+  getAutofillPrompt: () => invoke<boolean>("get_autofill_prompt"),
+  setAutofillPrompt: (enabled: boolean) => invoke<void>("set_autofill_prompt", { enabled }),
+
   saveS3Config: (config: S3Config) => invoke<void>("save_s3_config", { config }),
   loadS3Config: () => invoke<S3Config | null>("load_s3_config"),
   testS3Connection: () => invoke<string>("test_s3_connection"),

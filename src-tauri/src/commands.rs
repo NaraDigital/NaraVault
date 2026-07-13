@@ -280,6 +280,39 @@ pub async fn save_s3_config(state: State<'_, AppState>, config: S3Config) -> App
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Autofill consent preference
+// ---------------------------------------------------------------------------
+
+/// Settings key for the browser-autofill consent toggle. Value is encrypted
+/// `b"1"` (prompt on each login fill — the secure default) or `b"0"` (skip the
+/// prompt; origin-match + unlocked are still enforced by the bridge).
+pub const AUTOFILL_PROMPT_KEY: &str = "autofill_prompt";
+
+/// Read the login-autofill prompt preference. Defaults to `true` when unset.
+#[tauri::command]
+pub async fn get_autofill_prompt(state: State<'_, AppState>) -> AppResult<bool> {
+    let row = {
+        let conn = state.conn.lock().expect("conn poisoned");
+        db::load_setting(&conn, AUTOFILL_PROMPT_KEY)?
+    };
+    let Some((nonce, ciphertext)) = row else {
+        return Ok(true);
+    };
+    let plain = state.with_dek(|dek| crate::crypto::open(dek, &nonce, &ciphertext))?;
+    Ok(plain != b"0")
+}
+
+/// Persist the login-autofill prompt preference (encrypted under the DEK).
+#[tauri::command]
+pub async fn set_autofill_prompt(state: State<'_, AppState>, enabled: bool) -> AppResult<()> {
+    let value: &[u8] = if enabled { b"1" } else { b"0" };
+    let sealed = state.with_dek(|dek| crate::crypto::seal(dek, value))?;
+    let conn = state.conn.lock().expect("conn poisoned");
+    db::save_setting(&conn, AUTOFILL_PROMPT_KEY, &sealed.nonce, &sealed.ciphertext)?;
+    Ok(())
+}
+
 /// Decrypt and return the stored S3 config, or `null` if none is saved yet.
 #[tauri::command]
 pub async fn load_s3_config(state: State<'_, AppState>) -> AppResult<Option<S3Config>> {
